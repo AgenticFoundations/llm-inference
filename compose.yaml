@@ -1,0 +1,71 @@
+# Runs on OrbStack. Native Ollama is an existing external service, never managed here.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?Run make setup}
+    restart: "no"
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run make setup}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U litellm -d litellm']
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    logging: *logging
+
+  gateway:
+    image: ${LITELLM_IMAGE:?Run make setup}
+    restart: "no"
+    command: [--config, /app/config.yaml, --host, 0.0.0.0, --port, "4000"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Use make up}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Run make setup}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?Run make setup}
+      LITELLM_TELEMETRY: "False"
+      NO_DOCS: "True"
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT}:4000"
+    networks: [backend, database]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:4000/health/readiness", timeout=2)']
+      interval: 5s
+      timeout: 4s
+      retries: 48
+    logging: *logging
+
+  edge:
+    image: ${NGINX_IMAGE:?Run make setup}
+    restart: "no"
+    ports:
+      - "127.0.0.1:${EDGE_PORT}:8080"
+    networks: [backend]
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+volumes:
+  postgres-data:
+
+networks:
+  database:
+    internal: true
+  backend:

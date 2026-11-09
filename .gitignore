@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.runtime/
+.venv/
+.codex/
+.agents/
+.aws/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+.DS_Store

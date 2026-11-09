@@ -1,0 +1,17 @@
+{
+    "makefile.makePath": "make",
+    "makefile.makeDirectory": "${workspaceFolder}",
+    "makefile.makefilePath": "${workspaceFolder}/Makefile",
+    "makefile.phonyOnlyTargets": true,
+    "makefile.configureOnOpen": false,
+    "makefile.configureOnEdit": false,
+    "makefile.configureAfterCommand": false,
+    "makefile.buildBeforeLaunch": false,
+    "makefile.configurations": [
+        {
+            "name": "Local",
+            "makeArgs": [],
+            "problemMatchers": []
+        }
+    ]
+}

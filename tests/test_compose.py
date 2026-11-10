@@ -1,11 +1,12 @@
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
-from dotenv import dotenv_values
 
-from llm_inference.config import INGRESS_TIMEOUT_SECONDS, AppError
+from llm_inference.errors import AppError
+from llm_inference.models import INGRESS_TIMEOUT_SECONDS
 
 
 def test_container_exposure_and_manual_lifecycle_contract():
@@ -33,10 +34,9 @@ def test_nginx_matches_request_timeout_cap(config):
         match = re.search(rf"^\s*{directive}\s+(\d+)s;", nginx, re.MULTILINE)
         assert match is not None
         assert int(match[1]) == INGRESS_TIMEOUT_SECONDS
-    defaults = dotenv_values(root / ".env.example", interpolate=False)
-    assert int(defaults["REQUEST_TIMEOUT"]) <= INGRESS_TIMEOUT_SECONDS
-    config.values["REQUEST_TIMEOUT"] = str(INGRESS_TIMEOUT_SECONDS)
+    from llm_inference.models import ModelCatalog
+
+    config.catalog = ModelCatalog((replace(config.models[0], timeout=INGRESS_TIMEOUT_SECONDS),))
     config.validate()
-    config.values["REQUEST_TIMEOUT"] = str(INGRESS_TIMEOUT_SECONDS + 1)
-    with pytest.raises(AppError, match="REQUEST_TIMEOUT"):
-        config.validate()
+    with pytest.raises(AppError, match="timeout"):
+        replace(config.models[0], timeout=INGRESS_TIMEOUT_SECONDS + 1)

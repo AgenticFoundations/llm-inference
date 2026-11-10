@@ -3,10 +3,27 @@
 import httpx
 
 from . import transport
-from .config import AppError, Config
+from .config import Config
+from .errors import AppError
+from .models import ModelSpec
 from .runtime import wait_for
 
 UNLOAD_TIMEOUT_SECONDS = 30
+
+
+def model_names(response: httpx.Response) -> set[str]:
+    try:
+        data = response.json()
+    except ValueError:
+        raise AppError("Ollama returned invalid JSON for its model list.") from None
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise AppError("Ollama returned a malformed model list.")
+    names = set()
+    for item in data["models"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise AppError("Ollama returned a malformed model entry.")
+        names.add(item["name"])
+    return names
 
 
 def require_model(config: Config) -> None:
@@ -19,12 +36,13 @@ def require_model(config: Config) -> None:
             f"Your existing Ollama server is unavailable at {config.ollama_url}. "
             "Open your installed Ollama app yourself; this project never launches a server."
         ) from exc
-    names = {item["name"] for item in response.json()["models"]}
-    if config["OLLAMA_MODEL"] not in names:
+    names = model_names(response)
+    missing = set(config.model_routes.values()) - names
+    if missing:
         available = ", ".join(sorted(names)) or "none"
         raise AppError(
-            f"Model {config['OLLAMA_MODEL']} is not installed. Available: {available}. "
-            "Set OLLAMA_MODEL to the exact installed tag. No automatic downloads."
+            f"Model {', '.join(sorted(missing))} is not installed. Available: {available}. "
+            "Configure exact installed model tags. No automatic downloads."
         )
 
 
@@ -32,29 +50,32 @@ def loaded_models(config: Config) -> set[str]:
     response = transport.ok(
         transport.request("GET", config.ollama_url + "/api/ps"), "Ollama loaded models"
     )
-    return {str(item["name"]) for item in response.json()["models"]}
+    return model_names(response)
 
 
-def load_model(config: Config) -> None:
+def load_model(config: Config, model: ModelSpec) -> None:
+    if model not in config.models:
+        raise AppError("Refusing to preload a model outside this project's active catalog.")
     require_model(config)
     transport.ok(
         transport.request(
             "POST",
             config.ollama_url + "/api/generate",
-            timeout=config.number("REQUEST_TIMEOUT"),
+            timeout=model.timeout,
             payload={
-                "model": config["OLLAMA_MODEL"],
+                "model": model.model,
                 "stream": False,
-                "keep_alive": config["OLLAMA_KEEP_ALIVE"],
-                "options": {"num_ctx": config.number("OLLAMA_CONTEXT_LENGTH")},
+                "keep_alive": model.keep_alive,
+                "options": {"num_ctx": model.context_window},
             },
         ),
         "Model loading",
     )
 
 
-def unload_model(config: Config) -> None:
-    model = config["OLLAMA_MODEL"]
+def unload_model(config: Config, model: str) -> None:
+    if model not in config.model_routes.values():
+        raise AppError("Refusing to unload a model outside this project's configuration.")
     if model not in loaded_models(config):
         return  # Do not send an empty generation request for an unloaded model.
     transport.ok(
@@ -71,3 +92,14 @@ def unload_model(config: Config) -> None:
         lambda: model not in loaded_models(config),
         UNLOAD_TIMEOUT_SECONDS,
     )
+
+
+def unload_models(config: Config) -> None:
+    errors = []
+    for model in dict.fromkeys(config.model_routes.values()):
+        try:
+            unload_model(config, model)
+        except (httpx.RequestError, AppError):
+            errors.append(model)
+    if errors:
+        raise AppError("Could not unload configured models: " + ", ".join(errors))

@@ -3,13 +3,21 @@
 import json
 import re
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 import httpx
 
 from . import transport
-from .config import AppError, Config
+from .config import Config
+from .errors import AppError
+from .models import ModelSpec
 from .storage import private_json
+
+
+class StoredKey(TypedDict):
+    key: str
+    model: NotRequired[str]
+    models: NotRequired[list[str]]
 
 
 def key_path(config: Config, name: str) -> Path:
@@ -20,29 +28,39 @@ def key_path(config: Config, name: str) -> Path:
 
 def client_key(config: Config, name: str = "copilot") -> str:
     path = key_path(config, name)
+    aliases = list(config.model_routes)
     if path.exists():
-        stored = cast(dict[str, str], json.loads(path.read_text()))
-        if stored.get("model") == config["MODEL_ALIAS"]:
-            response = transport.request(
-                "GET", config.gateway_url + "/v1/models", key=stored["key"]
-            )
-            if response.is_success:
-                return stored["key"]
-            if response.status_code not in (401, 403):
-                transport.ok(response, "Client-key validation")
-        # A changed alias gets a fresh key; revoke the old one first.
+        stored = cast(StoredKey, json.loads(path.read_text()))
+        response = transport.request("GET", config.gateway_url + "/v1/models", key=stored["key"])
+        if response.is_success:
+            previous = stored.get("models", [stored.get("model", "")])
+            if set(previous) != set(aliases):
+                # Keep the same raw key so existing clients' secure-store entries still work.
+                transport.ok(
+                    transport.request(
+                        "POST",
+                        config.gateway_url + "/key/update",
+                        key=config["LITELLM_MASTER_KEY"],
+                        payload={"key": stored["key"], "models": aliases},
+                    ),
+                    "Client-key model update",
+                )
+                private_json(path, {"key": stored["key"], "models": aliases})
+            return stored["key"]
+        if response.status_code not in (401, 403):
+            transport.ok(response, "Client-key validation")
         revoke_key(config, name)
     response = transport.ok(
         transport.request(
             "POST",
             config.gateway_url + "/key/generate",
             key=config["LITELLM_MASTER_KEY"],
-            payload={"models": [config["MODEL_ALIAS"]], "key_alias": name},
+            payload={"models": aliases, "key_alias": name},
         ),
         "Client-key creation",
     )
     key = cast(str, response.json()["key"])
-    private_json(path, {"key": key, "model": config["MODEL_ALIAS"]})
+    private_json(path, {"key": key, "models": aliases})
     return key
 
 
@@ -72,8 +90,8 @@ def check_routes(config: Config, key: str, base_url: str | None = None) -> None:
     response = transport.ok(
         transport.request("GET", base + "/v1/models", key=key), "Model discovery"
     )
-    if config["MODEL_ALIAS"] not in {model["id"] for model in response.json()["data"]}:
-        raise AppError("The configured model alias is absent from gateway discovery.")
+    if not set(config.model_routes) <= {model["id"] for model in response.json()["data"]}:
+        raise AppError("A configured model alias is absent from gateway discovery.")
     for path in ("/ui", "/key/generate", "/config/yaml", "/model/new", "/api/tags"):
         response = transport.request("POST", base + path, key=key, payload={})
         if response.status_code != 404:
@@ -83,20 +101,24 @@ def check_routes(config: Config, key: str, base_url: str | None = None) -> None:
             raise AppError("Ingress did not reject an unsupported HTTP method.")
 
 
-def check_inference(config: Config, key: str, base_url: str | None = None) -> None:
+def check_inference(
+    config: Config, key: str, model: ModelSpec, base_url: str | None = None
+) -> None:
     body = {
-        "model": config["MODEL_ALIAS"],
+        "model": model.alias,
         "messages": [{"role": "user", "content": "Reply with the word ready."}],
-        "max_tokens": 32,
+        "max_tokens": min(32, model.max_output_tokens),
     }
     url = (base_url or config.edge_url) + "/v1/chat/completions"
     response = transport.ok(
-        transport.request(
-            "POST", url, key=key, payload=body, timeout=config.number("REQUEST_TIMEOUT")
-        ),
+        transport.request("POST", url, key=key, payload=body, timeout=model.timeout),
         "Inference",
     )
-    if not response.json().get("choices"):
+    try:
+        data = response.json()
+    except ValueError:
+        raise AppError("Inference returned invalid JSON.") from None
+    if not isinstance(data, dict) or not data.get("choices"):
         raise AppError("Inference returned no choices.")
     # Consume SSE incrementally; a 200 alone does not prove a working stream.
     saw_choice = saw_done = False
@@ -105,7 +127,7 @@ def check_inference(config: Config, key: str, base_url: str | None = None) -> No
         url,
         headers={"Authorization": f"Bearer {key}"},
         json={**body, "stream": True},
-        timeout=config.number("REQUEST_TIMEOUT"),
+        timeout=model.timeout,
         trust_env=False,
     ) as stream:
         transport.ok(stream, "Streaming inference")

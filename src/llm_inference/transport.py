@@ -2,7 +2,7 @@
 
 import httpx
 
-from .config import AppError
+from .errors import AppError
 
 
 def request(

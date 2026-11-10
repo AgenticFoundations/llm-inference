@@ -8,7 +8,8 @@ from llm_inference.bootstrap import setup
 from llm_inference.config import SECRET_KEYS, Config
 
 
-def test_setup_generates_distinct_private_credentials(tmp_path, monkeypatch, capsys):
+def test_setup_generates_distinct_private_credentials(project_files, monkeypatch, capsys):
+    tmp_path = project_files
     template = Path(__file__).resolve().parents[1] / ".env.example"
     shutil.copy(template, tmp_path / ".env.example")
     for key in dotenv_values(template, interpolate=False):

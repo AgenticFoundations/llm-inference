@@ -51,7 +51,10 @@ services:
     restart: "no"
     ports:
       - "127.0.0.1:${EDGE_PORT}:8080"
-    networks: [backend]
+    networks:
+      backend: {}
+      ingress:
+        aliases: [llm-edge]
     depends_on:
       gateway:
         condition: service_healthy
@@ -69,3 +72,7 @@ networks:
   database:
     internal: true
   backend:
+
+  ingress:
+    external: true
+    name: ${EDGE_NETWORK:-homelab-edge}

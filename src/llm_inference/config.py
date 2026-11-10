@@ -1,28 +1,26 @@
 """Configuration is data: dotenv files are never sourced by a shell."""
 
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 from urllib.parse import quote
 
 from dotenv import dotenv_values
 
+from .errors import AppError
+from .models import INGRESS_TIMEOUT_SECONDS as INGRESS_TIMEOUT_SECONDS
+from .models import ModelCatalog, ModelSpec
 from .storage import private_json
 
 SECRET_KEYS = ("LITELLM_MASTER_KEY", "LITELLM_SALT_KEY", "POSTGRES_PASSWORD")
-# Keep aligned with Nginx's proxy timeouts; these measure inactivity, not total duration.
-INGRESS_TIMEOUT_SECONDS = 900
-
-
-class AppError(Exception):
-    """An actionable error suitable for the terminal."""
 
 
 @dataclass
 class Config:
     root: Path
     values: dict[str, str] = field(repr=False)
+    catalog: ModelCatalog
 
     @classmethod
     def load(cls, root: Path) -> "Config":
@@ -34,7 +32,9 @@ class Config:
             key: os.environ.get(key, supplied.get(key, default)) or ""
             for key, default in defaults.items()
         }
-        config = cls(root, values)
+        if not values["MODELS_CONFIG"]:
+            raise AppError("MODELS_CONFIG must point to a model catalog JSON file.")
+        config = cls(root, values, ModelCatalog.load(root / values["MODELS_CONFIG"]))
         config.validate()
         return config
 
@@ -43,6 +43,56 @@ class Config:
 
     def number(self, key: str) -> int:
         return int(self[key])
+
+    @property
+    def models(self) -> tuple[ModelSpec, ...]:
+        return self.catalog.chat_models
+
+    @property
+    def model_routes(self) -> dict[str, str]:
+        return {model.alias: model.model for model in self.models}
+
+    def snapshot(self) -> dict[str, object]:
+        return {"values": dict(self.values), "catalog": self.catalog.to_dict()}
+
+    @classmethod
+    def from_snapshot(cls, root: Path, data: dict[str, object]) -> "Config":
+        if "catalog" not in data:
+            # Compatibility is limited to old saved sessions, so cleanup remains possible.
+            values = cast(dict[str, str], data)
+            try:
+                catalog = ModelCatalog.from_legacy_session(values)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise AppError("Cannot restore the saved model configuration.") from exc
+        else:
+            supplied = data.get("values")
+            if not isinstance(supplied, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in supplied.items()
+            ):
+                raise AppError("Saved service configuration is malformed.")
+            values = cast(dict[str, str], supplied)
+            catalog = ModelCatalog.from_data(data["catalog"])
+        config = cls(root, values, catalog)
+        config.validate()
+        return config
+
+    def copilot_models(self) -> list[dict[str, object]]:
+        return [
+            {
+                "id": model.alias,
+                "name": model.name,
+                "url": self.edge_url + "/v1/chat/completions",
+                "apiType": "chat-completions",
+                "contextWindow": model.context_window,
+                "maxInputTokens": model.max_input_tokens,
+                "maxOutputTokens": model.max_output_tokens,
+                "toolCalling": model.capabilities.tools,
+                "thinking": model.capabilities.thinking,
+                "vision": "image" in model.capabilities.input,
+            }
+            for model in self.models
+        ]
 
     @property
     def ollama_url(self) -> str:
@@ -67,24 +117,8 @@ class Config:
             ports.append(int(self[key]))
         if len(set(ports)) != len(ports):
             raise AppError("Service ports must differ.")
-        for key in (
-            "STARTUP_TIMEOUT",
-            "REQUEST_TIMEOUT",
-            "OLLAMA_CONTEXT_LENGTH",
-        ):
-            if not self[key].isdigit() or int(self[key]) < 1:
-                raise AppError(f"{key} must be a positive integer.")
-        if self.number("REQUEST_TIMEOUT") > INGRESS_TIMEOUT_SECONDS:
-            raise AppError(
-                f"REQUEST_TIMEOUT cannot exceed the ingress timeout of {INGRESS_TIMEOUT_SECONDS} "
-                "seconds."
-            )
-        if not re.fullmatch(r"(?:0|[1-9]\d*(?:ms|s|m|h))", self["OLLAMA_KEEP_ALIVE"]):
-            raise AppError("OLLAMA_KEEP_ALIVE must be 0 or a finite duration such as 5m.")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", self["OLLAMA_MODEL"]):
-            raise AppError("OLLAMA_MODEL must be an exact local Ollama model tag.")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self["MODEL_ALIAS"]):
-            raise AppError("MODEL_ALIAS must use letters, numbers, dots, underscores, or hyphens.")
+        if not self["STARTUP_TIMEOUT"].isdigit() or int(self["STARTUP_TIMEOUT"]) < 1:
+            raise AppError("STARTUP_TIMEOUT must be a positive integer.")
         for key in SECRET_KEYS:
             if len(self[key]) < 24:
                 raise AppError(f"{key} must contain at least 24 characters; run make setup.")
@@ -121,21 +155,28 @@ class Config:
             {
                 "model_list": [
                     {
-                        "model_name": self["MODEL_ALIAS"],
+                        "model_name": model.alias,
                         "litellm_params": {
-                            "model": "ollama_chat/" + self["OLLAMA_MODEL"],
+                            "model": "ollama_chat/" + model.model,
                             "api_base": f"http://host.docker.internal:{self['OLLAMA_PORT']}",
-                            "keep_alive": self["OLLAMA_KEEP_ALIVE"],
-                            "num_ctx": self.number("OLLAMA_CONTEXT_LENGTH"),
-                            "timeout": self.number("REQUEST_TIMEOUT"),
+                            "keep_alive": model.keep_alive,
+                            "num_ctx": model.context_window,
+                            "timeout": model.timeout,
+                            "max_tokens": model.max_output_tokens,
+                        },
+                        "model_info": {
+                            "mode": "chat",
+                            "max_input_tokens": model.max_input_tokens,
+                            "max_output_tokens": model.max_output_tokens,
                         },
                     }
+                    for model in self.models
                 ],
                 "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
                 "litellm_settings": {
                     "telemetry": False,
                     "turn_off_message_logging": True,
-                    "request_timeout": self.number("REQUEST_TIMEOUT"),
+                    "request_timeout": max(model.timeout for model in self.models),
                     "num_retries": 0,
                 },
             },

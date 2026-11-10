@@ -9,8 +9,9 @@ import httpx
 
 from . import gateway
 from .bootstrap import setup
-from .config import AppError, Config
+from .config import Config
 from .controller import Controller
+from .errors import AppError
 from .runtime import lifecycle_lock
 
 
@@ -24,8 +25,7 @@ def main(argv: list[str] | None = None) -> int:
         "down",
         "restart",
         "status",
-        "check",
-        "model-start",
+        "copilot-config",
         "model-stop",
     ):
         sub.add_parser(name)
@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     logs.add_argument("service", nargs="?", choices=["gateway", "db", "edge"])
     for command in ("key", "revoke"):
         sub.add_parser(command).add_argument("name", nargs="?", default="copilot")
+    sub.add_parser("model-start").add_argument("model", help="Alias of the model to preload")
+    sub.add_parser("check").add_argument("model", nargs="?", help="Check one alias; omit for all")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[2]
     controller = Controller(root)
@@ -48,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
             case "logs":
                 controller.logs(args.service)
             case "model-start":
-                controller.model_start()
+                controller.model_start(args.model)
+            case "check":
+                controller.check(args.model)
+            case "copilot-config":
+                controller.copilot_config()
             case "model-stop":
                 controller.model_stop()
             case "key":

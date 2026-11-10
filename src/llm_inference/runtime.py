@@ -10,7 +10,8 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
-from .config import AppError, Config
+from .config import Config
+from .errors import AppError
 
 ORB_DOCKER = Path("/Applications/OrbStack.app/Contents/MacOS/xbin/docker")
 PROJECT = "llm-inference"

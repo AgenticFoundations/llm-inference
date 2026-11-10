@@ -1,0 +1,47 @@
+{
+  "models": [
+    {
+      "alias": "local-coder",
+      "name": "Local Qwen MXFP8",
+      "type": "chat",
+      "model": "qwen3.8:27b-mxfp8",
+      "context_window": 262144,
+      "max_input_tokens": 229376,
+      "max_output_tokens": 32768,
+      "keep_alive": "5m",
+      "timeout": 900,
+      "capabilities": {
+        "input": ["text", "image"],
+        "output": ["text"],
+        "tools": true,
+        "thinking": true
+      }
+    },
+    {
+      "alias": "local-coder-bf16",
+      "name": "Local Qwen BF16",
+      "type": "chat",
+      "model": "qwen3.8:27b-mlx-bf16",
+      "context_window": 262144,
+      "max_input_tokens": 229376,
+      "max_output_tokens": 32768,
+      "keep_alive": "5m",
+      "timeout": 900,
+      "capabilities": {
+        "input": ["text", "image"],
+        "output": ["text"],
+        "tools": true,
+        "thinking": true
+      }
+    },
+    {
+      "alias": "local-image",
+      "name": "Image generation (backend not configured)",
+      "type": "image_generation",
+      "enabled": false,
+      "model": null,
+      "endpoint": null,
+      "parameters": {}
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import json
 import stat
 from types import SimpleNamespace
 
@@ -5,9 +6,11 @@ import httpx
 import pytest
 
 from llm_inference import controller as module
-from llm_inference.config import AppError
 from llm_inference.controller import Controller
+from llm_inference.errors import AppError
+from llm_inference.models import ModelCatalog
 from llm_inference.runtime import lifecycle_lock
+from llm_inference.storage import private_json
 
 
 @pytest.fixture
@@ -38,8 +41,8 @@ def harness(config, monkeypatch):
     monkeypatch.setattr(module, "port_in_use", lambda _: False)
     monkeypatch.setattr(
         module.ollama,
-        "unload_model",
-        lambda current: events.append(("unload-model", current["OLLAMA_MODEL"])),
+        "unload_models",
+        lambda current: events.append(("unload-model", current.models[0].model)),
     )
     monkeypatch.setattr(Controller, "ready", staticmethod(lambda _: True))
     monkeypatch.setattr(module.gateway, "client_key", lambda _: "sk-client")
@@ -47,7 +50,9 @@ def harness(config, monkeypatch):
     monkeypatch.setattr(
         module.transport,
         "request",
-        lambda *_: httpx.Response(200, json={"models": [{"name": config["OLLAMA_MODEL"]}]}),
+        lambda *_: httpx.Response(
+            200, json={"models": [{"name": model.model} for model in config.models]}
+        ),
     )
     return SimpleNamespace(
         controller=Controller(config.root),
@@ -79,9 +84,9 @@ def test_startup_order_idempotence_and_shutdown(harness):
     assert len(compose_events(harness, "up")) == before
     app.down()
     assert not app.state_path.exists()
-    assert ("unload-model", harness.config["OLLAMA_MODEL"]) in harness.events
+    assert ("unload-model", harness.config.models[0].model) in harness.events
     assert harness.events.index(("down", "--timeout", "10", "--remove-orphans")) < (
-        harness.events.index(("unload-model", harness.config["OLLAMA_MODEL"]))
+        harness.events.index(("unload-model", harness.config.models[0].model))
     )
     assert ("down", "--timeout", "10", "--remove-orphans") in harness.events
     app.down()  # Repeated stop is harmless.
@@ -164,7 +169,10 @@ def test_lifecycle_uses_only_project_compose_operations(harness):
 
 def test_changed_config_requires_restart(harness, monkeypatch):
     harness.controller.up()
-    monkeypatch.setenv("OLLAMA_MODEL", "another:tag")
+    path = harness.config.root / "config/models.json"
+    data = json.loads(path.read_text())
+    data["models"][0]["model"] = "another:tag"
+    path.write_text(json.dumps(data))
     with pytest.raises(AppError, match="prior session"):
         harness.controller.up()
     harness.controller.down()
@@ -180,10 +188,14 @@ def test_resolve_config_uses_file_before_start_and_snapshot_after_start(harness,
     app = harness.controller
     assert app.resolve_config().values == harness.config.values
     app.up()
-    monkeypatch.setenv("OLLAMA_MODEL", "another:tag")
-    assert app.resolve_config()["OLLAMA_MODEL"] == harness.config["OLLAMA_MODEL"]
-    assert app.active_config()["OLLAMA_MODEL"] == harness.config["OLLAMA_MODEL"]
+    path = harness.config.root / "config/models.json"
+    data = json.loads(path.read_text())
+    data["models"][0]["model"] = "another:tag"
+    path.write_text(json.dumps(data))
+    assert app.resolve_config().models[0].model == harness.config.models[0].model
+    assert app.active_config().models[0].model == harness.config.models[0].model
     (harness.config.root / ".env").unlink()
+    path.unlink()
     assert app.resolve_config().values == harness.config.values
     assert app.active_config().values == harness.config.values
 
@@ -198,12 +210,15 @@ def test_status_reports_saved_routing_and_configuration_drift(harness, monkeypat
     harness.controller.up()
     capsys.readouterr()
     harness.events.clear()
-    monkeypatch.setenv("OLLAMA_MODEL", "another:tag")
+    path = harness.config.root / "config/models.json"
+    data = json.loads(path.read_text())
+    data["models"][0]["model"] = "another:tag"
+    path.write_text(json.dumps(data))
     harness.controller.status()
     output = capsys.readouterr().out
-    assert f"local-coder -> {harness.config['OLLAMA_MODEL']}" in output
-    assert f"Loaded in memory: {harness.config['OLLAMA_MODEL']}" in output
-    assert ".env differs" in output
+    assert f"local-coder -> {harness.config.models[0].model}" in output
+    assert f"Loaded in memory: {harness.config.models[0].model}" in output
+    assert "Configuration differs" in output
     assert harness.events == [("ps", "--all")]
 
 
@@ -221,3 +236,69 @@ def test_status_survives_missing_env_and_unavailable_ollama(harness, monkeypatch
     assert "Loaded in memory: unavailable" in output
     assert "showing the saved session configuration" in output
     assert "private connection details" not in output
+
+
+def configure_two_models(harness, second_model):
+    harness.config.catalog = ModelCatalog((*harness.config.models, second_model))
+    path = harness.config.root / "config/models.json"
+    path.write_text(json.dumps(harness.config.catalog.to_dict()))
+
+
+@pytest.mark.parametrize("failed", [None, "local-coder", "local-coder-bf16"])
+def test_check_smokes_every_model_and_reports_any_failures(
+    harness, second_model, monkeypatch, capsys, failed
+):
+    configure_two_models(harness, second_model)
+    harness.controller.up()
+    private_json(module.gateway.key_path(harness.config, "copilot"), {"key": "sk-client"})
+    tested = []
+
+    def check(_config, _key, model):
+        tested.append(model.alias)
+        if model.alias == failed:
+            raise AppError("private upstream error")
+
+    monkeypatch.setattr(module.gateway, "check_inference", check)
+    if failed:
+        with pytest.raises(AppError, match=failed):
+            harness.controller.check()
+    else:
+        harness.controller.check()
+    assert tested == ["local-coder", "local-coder-bf16"]
+    assert "private upstream error" not in capsys.readouterr().out
+
+
+def test_check_can_target_one_alias_without_loading_the_other(harness, second_model, monkeypatch):
+    configure_two_models(harness, second_model)
+    harness.controller.up()
+    private_json(module.gateway.key_path(harness.config, "copilot"), {"key": "sk-client"})
+    tested = []
+    monkeypatch.setattr(
+        module.gateway, "check_inference", lambda _config, _key, model: tested.append(model.alias)
+    )
+    harness.controller.check("local-coder-bf16")
+    assert tested == ["local-coder-bf16"]
+
+
+def test_copilot_export_uses_catalog_budgets_without_contacting_services(harness, second_model):
+    configure_two_models(harness, second_model)
+    harness.controller.copilot_config()
+    path = harness.config.root / ".runtime/copilot-models.json"
+    data = json.loads(path.read_text())
+    models = {model["id"]: model for model in data["models"]}
+    assert models["local-coder"]["contextWindow"] == 16384
+    assert models["local-coder-bf16"]["contextWindow"] == 8192
+    assert models["local-coder-bf16"]["maxOutputTokens"] == 1024
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert "apiKey" not in path.read_text()
+    assert not harness.events
+
+
+def test_model_start_requires_explicit_alias_and_uses_that_models_settings(
+    harness, second_model, monkeypatch
+):
+    configure_two_models(harness, second_model)
+    loaded = []
+    monkeypatch.setattr(module.ollama, "load_model", lambda _config, model: loaded.append(model))
+    harness.controller.model_start("local-coder-bf16")
+    assert loaded == [second_model]

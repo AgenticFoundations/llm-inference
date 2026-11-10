@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from llm_inference import transport
-from llm_inference.config import AppError
+from llm_inference.errors import AppError
 
 
 @pytest.mark.parametrize("status", [401, 503])

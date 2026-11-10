@@ -3,7 +3,7 @@ import subprocess
 import pytest
 
 from llm_inference import runtime
-from llm_inference.config import AppError
+from llm_inference.errors import AppError
 
 
 @pytest.mark.parametrize(

@@ -80,7 +80,8 @@ unloads after its catalog `keep_alive` duration of inactivity (five minutes for 
 | `make typecheck` | Run strict mypy checks on all application source under `src/` |
 
 `make down` retains downloaded models, the Postgres volume, and private client-key
-files. Containers have `restart: "no"`; restarting OrbStack does not restart them.
+files. Containers have `restart: unless-stopped`; they resume when the Docker engine starts
+unless intentionally stopped. OrbStack and native Ollama startup are managed separately.
 The controller never shuts down Ollama, OrbStack, or other applications' containers.
 Unloading configured models frees their memory, but other direct Ollama clients using
 those exact models share their loaded state and may load them again independently. Other

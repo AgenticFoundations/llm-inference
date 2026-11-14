@@ -9,11 +9,11 @@ from llm_inference.errors import AppError
 from llm_inference.models import INGRESS_TIMEOUT_SECONDS
 
 
-def test_container_exposure_and_manual_lifecycle_contract():
+def test_container_exposure_and_restart_contract():
     compose = yaml.safe_load((Path(__file__).resolve().parents[1] / "compose.yaml").read_text())
     services = compose["services"]
     for service in services.values():
-        assert service["restart"] == "no"
+        assert service["restart"] == "unless-stopped"
         for binding in service.get("ports", []):
             assert binding.startswith("127.0.0.1:")
         assert not any("docker.sock" in mount for mount in service.get("volumes", []))
@@ -23,7 +23,10 @@ def test_container_exposure_and_manual_lifecycle_contract():
     assert set(services) == {"db", "gateway", "edge"}
     for service in services.values():
         assert set(service["networks"]) <= set(compose["networks"])
-    assert not any(network and network.get("external") for network in compose["networks"].values())
+    assert compose["networks"]["ingress"]["external"] is True
+    assert services["edge"]["networks"]["ingress"]["aliases"] == ["llm-edge"]
+    assert "ingress" not in services["gateway"]["networks"]
+    assert "ingress" not in services["db"]["networks"]
     assert compose["networks"]["database"]["internal"] is True
 
 
